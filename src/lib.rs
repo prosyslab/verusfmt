@@ -29,11 +29,6 @@ struct Context {
 // When in doubt, we should generally try to stick to Rust style guidelines:
 //   https://doc.rust-lang.org/beta/style-guide/items.html
 
-/// Adds a comma that vanishes in single-line mode
-fn conditional_comma<'a>(arena: &'a Arena<'a, ()>) -> DocBuilder<'a, Arena<'a>> {
-    arena.text(",").flat_alt(arena.nil()) //.group()
-}
-
 /// Comma-delimited list with an optional final comma
 fn comma_delimited<'a>(
     ctx: &Context,
@@ -88,7 +83,7 @@ fn comma_delimited<'a>(
                         // rather than a one-tuple
                         to_doc(ctx, p, arena).append(arena.text(","))
                     } else {
-                        to_doc(ctx, p, arena).append(conditional_comma(arena))
+                        to_doc(ctx, p, arena)
                     }
                 } else {
                     to_doc(ctx, p, arena)
@@ -106,7 +101,7 @@ fn comma_delimited<'a>(
     }
 }
 
-/// Comma-delimited list with a required final comma
+/// Comma-delimited list that always breaks across lines and never adds a trailing comma
 fn comma_delimited_full<'a>(
     ctx: &Context,
     arena: &'a Arena<'a, ()>,
@@ -139,7 +134,7 @@ fn comma_delimited_full<'a>(
                     }
                 ])
             } else {
-                to_doc(ctx, p, arena).append(arena.text(","))
+                to_doc(ctx, p, arena)
             }
         }
     });
