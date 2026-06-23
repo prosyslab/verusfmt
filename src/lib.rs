@@ -23,6 +23,7 @@ const INLINE_COMMENT_SPACE: usize = 2;
 
 struct Context {
     inline_comment_lines: HashSet<usize>,
+    space_generic_args: bool,
 }
 
 // When in doubt, we should generally try to stick to Rust style guidelines:
@@ -228,6 +229,30 @@ fn extra_spaced_braces<'a>(
     arena.space().append(spaced_braces(arena, doc))
 }
 
+/// Surround generic arguments with angle brackets that gain inner spacing only if on a single line
+fn generic_arg_enclosure<'a>(
+    arena: &'a Arena<'a, ()>,
+    doc: Option<DocBuilder<'a, Arena<'a>>>,
+    has_colons: bool,
+) -> DocBuilder<'a, Arena<'a>> {
+    let enclosed = match doc {
+        Some(doc) => docs![
+            arena,
+            arena.nil().flat_alt(arena.space()),
+            doc,
+            arena.nil().flat_alt(arena.space()),
+        ]
+        .angles()
+        .group(),
+        None => arena.text("<>").group(),
+    };
+    if has_colons {
+        arena.text("::").append(enclosed)
+    } else {
+        enclosed
+    }
+}
+
 fn block_braces<'a>(
     arena: &'a Arena<'a, ()>,
     doc: DocBuilder<'a, Arena<'a>>,
@@ -296,6 +321,23 @@ fn map_pairs_to_doc<'a>(
     pairs: &Pairs<'a, Rule>,
 ) -> DocBuilder<'a, Arena<'a>> {
     arena.concat(pairs.clone().map(|p| to_doc(ctx, p, arena)))
+}
+
+fn generic_arg_list_to_doc<'a>(
+    ctx: &Context,
+    arena: &'a Arena<'a, ()>,
+    pair: Pair<'a, Rule>,
+) -> DocBuilder<'a, Arena<'a>> {
+    let mut has_colons = false;
+    let mut generic_args = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::colons_str => has_colons = true,
+            Rule::generic_args => generic_args = Some(to_doc(ctx, p, arena)),
+            _ => {}
+        }
+    }
+    generic_arg_enclosure(arena, generic_args, has_colons)
 }
 
 // During formatting, rather than trying to dynamically decide when a single-line comment should be
@@ -825,8 +867,20 @@ fn to_doc<'a>(
         Rule::path_segment => map_to_doc(ctx, arena, pair),
         Rule::path_segment_no_generics => map_to_doc(ctx, arena, pair),
         Rule::path_segment_type => map_to_doc(ctx, arena, pair),
-        Rule::generic_arg_list => map_to_doc(ctx, arena, pair),
-        Rule::generic_arg_list_with_colons => map_to_doc(ctx, arena, pair),
+        Rule::generic_arg_list => {
+            if ctx.space_generic_args {
+                generic_arg_list_to_doc(ctx, arena, pair)
+            } else {
+                map_to_doc(ctx, arena, pair)
+            }
+        }
+        Rule::generic_arg_list_with_colons => {
+            if ctx.space_generic_args {
+                generic_arg_list_to_doc(ctx, arena, pair)
+            } else {
+                map_to_doc(ctx, arena, pair)
+            }
+        }
         Rule::generic_args => comma_delimited(ctx, arena, pair, false).group(),
         Rule::generic_arg => map_to_doc(ctx, arena, pair),
         Rule::type_arg => map_to_doc(ctx, arena, pair),
@@ -1673,9 +1727,10 @@ impl miette::Diagnostic for ParseAndFormatError {
     }
 }
 
-fn parse_and_format(s: &str) -> miette::Result<String> {
+fn parse_and_format(s: &str, space_generic_args: bool) -> miette::Result<String> {
     let ctx = Context {
         inline_comment_lines: find_inline_comment_lines(s),
+        space_generic_args,
     };
     let parsed_file = VerusParser::parse(Rule::file, s)
         .map_err(ParseAndFormatError::from)?
@@ -1777,7 +1832,7 @@ pub fn run(s: &str, opts: RunOptions) -> miette::Result<String> {
 
     let file_name = opts.file_name.clone().unwrap_or("<input>".into());
 
-    let verus_fmted = parse_and_format(unparsed_file).map_err(|e| {
+    let verus_fmted = parse_and_format(unparsed_file, opts.run_rustfmt).map_err(|e| {
         e.with_source_code(miette::NamedSource::new(
             file_name,
             unparsed_file.to_owned(),
