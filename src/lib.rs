@@ -24,6 +24,25 @@ const INLINE_COMMENT_SPACE: usize = 2;
 struct Context {
     inline_comment_lines: HashSet<usize>,
     space_generic_args: bool,
+    strip_verification_clauses: bool,
+}
+
+/// Clause nodes own their expressions and any comments parsed within them.
+fn is_verification_clause(rule: Rule) -> bool {
+    matches!(
+        rule,
+        Rule::requires_clause
+            | Rule::ensures_clause
+            | Rule::default_ensures_clause
+            | Rule::returns_clause
+            | Rule::recommends_clause
+            | Rule::decreases_clause
+            | Rule::invariant_clause
+            | Rule::invariant_except_break_clause
+            | Rule::invariant_ensures_clause
+            | Rule::opens_invariants_clause
+            | Rule::unwind_clause
+    )
 }
 
 // When in doubt, we should generally try to stick to Rust style guidelines:
@@ -515,7 +534,7 @@ fn loop_to_doc<'a>(
     // if we see a colon indicating `for x in y: e`
     let mut colon_expr = false;
     pair.clone().into_inner().for_each(|p| {
-        if p.as_rule() == Rule::loop_clause {
+        if p.as_rule() == Rule::loop_clause && !ctx.strip_verification_clauses {
             last_clause_span = Some(p.as_span())
         }
         if p.as_rule() == Rule::colon_str {
@@ -587,7 +606,7 @@ fn is_bare_trigger(pair: Pair<Rule>) -> bool {
 /// - contains a single-line expression and no statements
 /// - contains no comments
 fn expr_only_block(r: Rule, pairs: &Pairs<Rule>) -> bool {
-    assert!(matches!(r, Rule::stmt_list));
+    assert!(matches!(r, Rule::stmt_list | Rule::fn_block_expr));
     let count = pairs.clone().fold(0, |count, p| {
         count
             + match p.as_rule() {
@@ -635,11 +654,33 @@ fn debug_print(pair: Pair<Rule>, indent: usize) {
     }
 }
 
+/// Format a stripped const/static initializer as an expression block.
+fn initializer_to_doc<'a>(
+    ctx: &Context,
+    arena: &'a Arena<'a, ()>,
+    pair: Pair<'a, Rule>,
+) -> DocBuilder<'a, Arena<'a>> {
+    let pairs = pair.clone().into_inner();
+    if pairs.is_empty() {
+        arena.text("{}")
+    } else if expr_only_block(pair.as_rule(), &pairs) {
+        sticky_delims(ctx, arena, pair, Enclosure::Braces, true)
+    } else {
+        let mapped = arena.concat(pairs.clone().map(|p| to_doc(ctx, p, arena)));
+        block_braces(arena, mapped, terminal_expr(&pairs))
+    }
+}
+
 fn to_doc<'a>(
     ctx: &Context,
     pair: Pair<'a, Rule>,
     arena: &'a Arena<'a, ()>,
 ) -> DocBuilder<'a, Arena<'a>> {
+    if ctx.strip_verification_clauses
+        && (is_verification_clause(pair.as_rule()) || pair.as_rule() == Rule::assert_requires)
+    {
+        return arena.nil();
+    }
     let s = arena.text(pair.as_str().trim());
     info!("Processing rule {:?}", pair.as_rule());
     match pair.as_rule() {
@@ -980,7 +1021,10 @@ fn to_doc<'a>(
         Rule::r#fn => {
             let pairs = pair.into_inner();
             let has_qualifier = pairs.clone().any(|p| {
-                matches!(p.as_rule(), Rule::fn_qualifier) && p.clone().into_inner().count() > 0
+                matches!(p.as_rule(), Rule::fn_qualifier)
+                    && p.clone().into_inner().any(|child| {
+                        !ctx.strip_verification_clauses || !is_verification_clause(child.as_rule())
+                    })
             });
             let has_ret_type = pairs.clone().any(|p| {
                 matches!(p.as_rule(), Rule::ret_type) && p.clone().into_inner().count() > 0
@@ -1090,9 +1134,16 @@ fn to_doc<'a>(
         Rule::r#const | Rule::r#static =>
         // In this context, if there's an ensures clause, we need to add a line
         {
-            arena.concat(pair.into_inner().map(|p| match p.as_rule() {
-                Rule::ensures_clause => to_doc(ctx, p, arena).append(arena.line()),
-                _ => to_doc(ctx, p, arena),
+            arena.concat(pair.into_inner().map(|p| {
+                match p.as_rule() {
+                    Rule::ensures_clause if ctx.strip_verification_clauses => arena.nil(),
+                    Rule::fn_block_expr if ctx.strip_verification_clauses => arena
+                        .text(" = ")
+                        .append(initializer_to_doc(ctx, arena, p))
+                        .append(";"),
+                    Rule::ensures_clause => to_doc(ctx, p, arena).append(arena.line()),
+                    _ => to_doc(ctx, p, arena),
+                }
             }))
         }
         Rule::r#trait => map_to_doc(ctx, arena, pair),
@@ -1722,10 +1773,15 @@ impl miette::Diagnostic for ParseAndFormatError {
     }
 }
 
-fn parse_and_format(s: &str, space_generic_args: bool) -> miette::Result<String> {
+fn parse_and_format(
+    s: &str,
+    space_generic_args: bool,
+    strip_verification_clauses: bool,
+) -> miette::Result<String> {
     let ctx = Context {
         inline_comment_lines: find_inline_comment_lines(s),
         space_generic_args,
+        strip_verification_clauses,
     };
     let parsed_file = VerusParser::parse(Rule::file, s)
         .map_err(ParseAndFormatError::from)?
@@ -1807,6 +1863,9 @@ pub struct RunOptions {
     pub file_name: Option<String>,
     /// Whether to run rustfmt on non-verus parts of code.
     pub run_rustfmt: bool,
+    /// Remove parsed verification clauses, honoring `#[verusfmt::skip]`.
+    /// Proof statements and spec/proof definitions are retained.
+    pub strip_verification_clauses: bool,
     /// Whether to perform extra configuration for the rustfmt run. Ignored if `run_rustfmt` is false.
     pub rustfmt_config: RustFmtConfig,
 }
@@ -1816,6 +1875,7 @@ impl Default for RunOptions {
         Self {
             file_name: None,
             run_rustfmt: true,
+            strip_verification_clauses: false,
             rustfmt_config: Default::default(),
         }
     }
@@ -1827,7 +1887,12 @@ pub fn run(s: &str, opts: RunOptions) -> miette::Result<String> {
 
     let file_name = opts.file_name.clone().unwrap_or("<input>".into());
 
-    let verus_fmted = parse_and_format(unparsed_file, opts.run_rustfmt).map_err(|e| {
+    let verus_fmted = parse_and_format(
+        unparsed_file,
+        opts.run_rustfmt,
+        opts.strip_verification_clauses,
+    )
+    .map_err(|e| {
         e.with_source_code(miette::NamedSource::new(
             file_name,
             unparsed_file.to_owned(),

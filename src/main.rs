@@ -29,6 +29,10 @@ struct Args {
     /// Only format code inside the Verus macro
     #[arg(long = "verus-only")]
     verus_only: bool,
+    /// Remove verification clauses (requires, ensures, invariants, etc.) before formatting.
+    /// Retains proof code and honors #[verusfmt::skip].
+    #[arg(long)]
+    strip_verification_clauses: bool,
     /// Print debugging output (can be repeated for more detail)
     #[arg(short = 'd', long = "debug", action = clap::ArgAction::Count)]
     debug_level: u8,
@@ -74,6 +78,7 @@ fn format_file(file: &PathBuf, args: &Args) -> miette::Result<()> {
         verusfmt::RunOptions {
             file_name: Some(file.to_string_lossy().into()),
             run_rustfmt: !args.verus_only,
+            strip_verification_clauses: args.strip_verification_clauses,
             rustfmt_config: rustfmt_config.clone(),
         },
     )?;
@@ -107,6 +112,7 @@ fn format_file(file: &PathBuf, args: &Args) -> miette::Result<()> {
             verusfmt::RunOptions {
                 file_name: Some(file.to_string_lossy().into()),
                 run_rustfmt: !args.verus_only,
+                strip_verification_clauses: args.strip_verification_clauses,
                 rustfmt_config,
             },
         )?;
